@@ -2,20 +2,125 @@ trigger:
   branches:
     include:
       - master
+
 parameters:
+  - name: environment # Name of the environment in Azure Devops, must match the library name
+    type: string
+    values:
+      - subs-prod
+      - subs-dev
+      - subs-int
+      - subs-prep
+      - subs-uat
+
+  - name: env # Name of the environment in Azure.
+    type: string
+    values:
+      - prod
+      - dev
+      - int
+      - prep
+      - uat
+
+variables:
+  - group: Infrastructure.TF.${{ parameters.environment }} # Links the Variable Group based on the "environment" parameter
   - name: environment
-    type: string
-    values:
-      - nonprodus
+    value: ${{ parameters.environment }} 
   - name: env
-    type: string
-    values:
-      - test
+    value: ${{ parameters.env }} #Links the variable env
+
 stages:
-  - template: stages.yml
-    parameters:
-      environments:
-        - name: "${{ parameters.environment }}_stage"
-          environment: "${{ parameters.environment }}"
-          connectedService: "Service Connection Name "
-          location: "$(pipeline_location)"
+  # Stage 1: Plan
+  - stage: TerraformPlan
+    jobs:
+      - deployment: PlanJob
+        environment: ${{ parameters.environment }}
+        pool:
+          vmImage: 'ubuntu-latest'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - task: TerraformInstaller@1
+                  inputs:
+                    terraformVersion: 'latest'
+
+                - task: replacetokens@6
+                  inputs:
+                    root: '$(System.DefaultWorkingDirectory)/terraform'
+                    sources: '*.tf'
+                    tokenPattern: 'doubleunderscores'
+                    addBOM: true
+
+                - script: |
+                    cd ./terraform
+                    # Login using the service variables of the library associated with the environment
+                    az login --service-principal -u $(sp_client_id) -p $(sp_client_secret) --tenant $(tenant_id)
+                    terraform init
+
+                    # Check if the workspace already exists or create a new one
+                    if terraform workspace list | grep -q ${{ parameters.environment }}; then
+                      terraform workspace select ${{ parameters.environment }}
+                    else
+                      terraform workspace new ${{ parameters.environment }}
+                    fi
+
+                    # Check if .tf files exist
+                    if ls *.tf; then
+                      terraform plan -out=tfplan -var-file="./tfvars/${{ parameters.env }}.tfvars"
+                    else
+                      echo "No .tf files found in the directory."
+                      exit 1
+                    fi
+                  displayName: 'Terraform Plan'
+                - task: CopyFiles@2
+                  inputs:
+                    contents: '$(System.DefaultWorkingDirectory)/terraform/**'
+                    targetFolder: $(Build.ArtifactStagingDirectory)
+                - task: PublishBuildArtifacts@1
+                  displayName: 'Publish Terraform Plan Artifact'
+                  inputs:
+                    pathtoPublish: '$(System.DefaultWorkingDirectory)/terraform/'
+                    artifactName: 'tfplan'
+
+  # Stage 2: Apply
+  - stage: TerraformApply
+    dependsOn: TerraformPlan
+    jobs:
+      - deployment: ApplyJob
+        environment: ${{ parameters.environment }}
+        pool:
+          vmImage: 'ubuntu-latest'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: DownloadPipelineArtifact@2
+                  inputs:
+                    artifactName: 'tfplan'
+                    targetPath: '$(System.DefaultWorkingDirectory)/terraform/'
+                  displayName: 'Download Terraform Plan Artifact'
+
+                - task: TerraformInstaller@1
+                  inputs:
+                    terraformVersion: 'latest'
+
+                - script: |
+                    cd ./terraform
+                    rm -rf .terraform
+                    # Login using library service variables
+                    az login --service-principal -u $(sp_client_id) -p $(sp_client_secret) --tenant $(tenant_id)
+                    terraform init
+
+                    # Check if the workspace already exists or create a new one
+                    if terraform workspace list | grep -q ${{ parameters.environment }}; then
+                      terraform workspace select ${{ parameters.environment }}
+                    else
+                      terraform workspace new ${{ parameters.environment }}
+                    fi
+
+                    terraform apply -auto-approve $(System.DefaultWorkingDirectory)/terraform/tfplan
+                  displayName: 'Terraform Apply'
